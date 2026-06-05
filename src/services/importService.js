@@ -3,7 +3,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 const { wrapper } = require('axios-cookiejar-support');
 const { CookieJar } = require('tough-cookie');
-const { classifyEngine, applyBoth, CAT } = require('../classifier/engine');
+const { classifyEngine, applyBoth, applyBothWithCustomSpaces, CAT } = require('../classifier/engine');
 
 const BASE_URL = process.env.ADMIN_URL || 'http://localhost:7869';
 
@@ -20,20 +20,28 @@ async function loginBot() {
     console.log('🔐 Bot logged in');
 }
 
-async function processAndImport(items, vendorId) {
+async function processAndImport(items, vendorId, keepSpacing = false) {
     try {
         await loginBot();
 
-        console.log(`\n[⚙️ ENGINE] Classifying & Formatting ${items.length} numbers...`);
+        console.log(`\n[⚙️ ENGINE] Classifying & Formatting ${items.length} numbers (Keep Spacing: ${keepSpacing})...`);
         let tableData = [];
         const rows = items.map(item => {
-            const clean = String(item.number).replace(/\D/g, '');
+            const numStrForSpace = String(item.number).trim();
+            const clean = numStrForSpace.replace(/\D/g, '');
             const rate = String(item.rate || '0').replace(/\D/g, '');
             const discount = String(item.discount || '0').replace(/\D/g, '');
             const portStatus = (item.port && item.port.toUpperCase() === 'CRTP') ? 'CRTP' : 'RTP';
             
             const res = classifyEngine(clean);
-            const styled = applyBoth(clean, res.matches);
+            
+            let styled = "";
+            if (keepSpacing) {
+                styled = applyBothWithCustomSpaces(numStrForSpace, res.matches);
+            } else {
+                styled = applyBoth(clean, res.matches);
+            }
+            
             const catName = CAT[res.catId] || 'Category';
 
             tableData.push({
@@ -115,15 +123,19 @@ async function updateVendorStatus(vendorEmail, targetStatus) {
     try {
         await loginBot();
         
-        console.log(`\n[📤 API] Initiating vendor status update for ${vendorEmail} to "${targetStatus}"...`);
+        console.log(`\n[⚙️  API] Initiating vendor status update for ${vendorEmail} to "${targetStatus}"...`);
         
         try {
-            const res = await client.post(`${BASE_URL}/api/v1/products/update-vendor-status`, { 
-                vendorEmail: vendorEmail,
-                targetStatus: targetStatus
+            const desiredActive = targetStatus === 'available';
+            
+            const res = await client.put(`${BASE_URL}/api/v1/vendors/action/toggle-by-email`, {
+                email: vendorEmail,
+                active: desiredActive
             });
-            console.log(`[📤 API] Status Update: ${res.status}`);
-            if (res.data) console.log(`[📤 API] Response: ${JSON.stringify(res.data)}`);
+            console.log(vendorEmail);
+            
+            console.log(`[⚙️  API] Toggle Status Update: ${res.status}`);
+            if (res.data) console.log(`[⚙️  API] Response: ${JSON.stringify(res.data)}`);
             return res.data;
         } catch (err) {
             console.error(`[❌ API ERROR] Failed to update vendor status:`, err.response?.data || err.message);
@@ -141,9 +153,26 @@ function startAutoLogin() {
     }, 5 * 60 * 1000);
 }
 
+async function getVendorInquiry(vendorEmail) {
+    try {
+        await loginBot();
+        console.log(`\n[🔍 API] Fetching inquiry data for ${vendorEmail}...`);
+        
+        const res = await client.get(`${BASE_URL}/api/v1/oldOrder/bot-inquiry?email=${vendorEmail}`);
+        if (res.data && res.data.success) {
+            return res.data.data;
+        }
+        return null;
+    } catch (err) {
+        console.error('[❌ API ERROR] Failed to fetch vendor inquiry:', err.response?.data || err.message);
+        return null;
+    }
+}
+
 module.exports = {
     processAndImport,
     removeNumbers,
     startAutoLogin,
-    updateVendorStatus
+    updateVendorStatus,
+    getVendorInquiry
 };

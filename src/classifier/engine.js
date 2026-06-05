@@ -28,7 +28,7 @@ function classifyEngine(raw) {
     if (i108 !== -1) return { catId: 8, matches: [[i108, i108 + 3]] };
 
     if (d.length >= 10 && d.slice(0, 5) === d.slice(5, 10)) {
-        return { catId: 2, matches: [[0, 5], [5, 10]] };
+        return { catId: 2, matches: [[0, 5]] };
     }
 
     let maxRun = 1, cur = 1, bestStart = 0;
@@ -89,15 +89,7 @@ function classifyEngine(raw) {
         if (k - j >= 3) trips.push([j, j+3]);
         j = k;
     }
-    let distinctTrips = [];
-    let seenDigits = new Set();
-    for (let t of trips) {
-        let digit = d[t[0]];
-        if (!seenDigits.has(digit)) {
-            seenDigits.add(digit); distinctTrips.push(t);
-        }
-    }
-    if (distinctTrips.length >= 2) return { catId: 17, matches: distinctTrips.slice(0,2) };
+    if (trips.length >= 2) return { catId: 17, matches: trips.slice(0,2) };
 
     if (maxRun >= 3) return { catId: 18, matches: [[bestStart, bestStart + maxRun]] };
 
@@ -129,14 +121,16 @@ function classifyEngine(raw) {
 
     const tens = ['10','20','30','40','50','60','70','80','90'];
     const hundreds = ['100','200','300','400','500','600','700','800','900'];
-    for (let i = 0; i < tens.length - 1; i++) {
+    for (let i = 0; i < tens.length - 2; i++) {
         let i1 = d.indexOf(tens[i]);
         let i2 = d.indexOf(tens[i+1]);
-        if (i1 !== -1 && i2 !== -1) return { catId: 6, matches: [[i1, i1+2], [i2, i2+2]] };
+        let i3 = d.indexOf(tens[i+2]);
+        if (i1 !== -1 && i2 !== -1 && i3 !== -1) return { catId: 6, matches: [[i1, i1+2], [i2, i2+2], [i3, i3+2]] };
         
         let j1 = d.indexOf(hundreds[i]);
         let j2 = d.indexOf(hundreds[i+1]);
-        if (j1 !== -1 && j2 !== -1) return { catId: 6, matches: [[j1, j1+3], [j2, j2+3]] };
+        let j3 = d.indexOf(hundreds[i+2]);
+        if (j1 !== -1 && j2 !== -1 && j3 !== -1) return { catId: 6, matches: [[j1, j1+3], [j2, j2+3], [j3, j3+3]] };
     }
     
     let maxAsc = 1, curAsc = 1, bestAscStart = 0, curAscStart = 0;
@@ -160,7 +154,7 @@ function classifyEngine(raw) {
         }
     }
     
-    if (maxAsc >= 2 || maxDesc >= 2) {
+    if (maxAsc >= 3 || maxDesc >= 3) {
         if (maxAsc >= maxDesc) return { catId: 6, matches: [[bestAscStart, bestAscStart + maxAsc]] };
         else return { catId: 6, matches: [[bestDescStart, bestDescStart + maxDesc]] };
     }
@@ -210,4 +204,34 @@ function applyBoth(cleanNum, primaryMatches) {
     return res.replace(/-+/g, '-').replace(/^-|-$/g, '');
 }
 
-module.exports = { classifyEngine, applyBoth, CAT };
+function applyBothWithCustomSpaces(rawStr, matches) {
+    if (!matches || matches.length === 0) return rawStr;
+    
+    let sorted = [...matches].sort((a,b) => a[0] - b[0]);
+    let result = '';
+    let digitIdx = 0;
+    
+    for (let i = 0; i < rawStr.length; i++) {
+        let char = rawStr[i];
+        let isDigit = /\d/.test(char);
+        
+        if (isDigit) {
+            for (let [start, end] of sorted) {
+                if (digitIdx === start) result += '*';
+            }
+        }
+        
+        result += char;
+        
+        if (isDigit) {
+            digitIdx++;
+            for (let [start, end] of sorted) {
+                if (digitIdx === end) result += '*';
+            }
+        }
+    }
+    
+    return result;
+}
+
+module.exports = { classifyEngine, applyBoth, applyBothWithCustomSpaces, CAT };
