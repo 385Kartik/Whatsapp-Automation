@@ -1,7 +1,9 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
-const { handleMessage } = require('../parser/aiParser');
+const { parseIntent, generateReply } = require('../parser/aiParser');
+const { processText, processExcelBuffer, splitMixedIntentText } = require('../services/classifierService');
+const importService = require('../services/importService');
 const { autoRegisterIfValid, getVendorByGroup, VendorGroup } = require('../services/vendorService');
 
 let sock;
@@ -12,140 +14,257 @@ function getBotStatus() {
     return { connected: isConnected, qr: currentQR };
 }
 
+async function processVendorMessage(sock, msg, sender, vendorId) {
+    try {
+        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || msg.message.documentMessage?.caption || '';
+        const isDocument = !!msg.message.documentMessage;
+        const isImageOrVideo = !!msg.message.imageMessage || !!msg.message.videoMessage;
+
+        // Ignore images and videos without documents
+        if (isImageOrVideo) {
+            console.log(`[⏭️ IGNORED] Image/Video ignored as per rules.`);
+            await sock.sendMessage(sender, { text: "⚠️ Photos aur videos is bot par support nahi hote. Kripya apne numbers Text ya Excel/CSV format mein bhejein." });
+            return;
+        }
+
+        if (!textMessage && !isDocument) {
+             console.log(`[🔍 DEBUG] Empty message ignored.`);
+             return;
+        }
+
+        let docMime = '';
+        let docFileName = '';
+        if (isDocument) {
+            docMime = msg.message.documentMessage.mimetype || '';
+            docFileName = msg.message.documentMessage.fileName || '';
+            const validDocs = ['.xlsx', '.xls', '.csv'];
+            const isValidDoc = validDocs.some(ext => docFileName.toLowerCase().endsWith(ext)) || 
+                               docMime.includes('spreadsheet') || 
+                               docMime.includes('csv') ||
+                               docMime.includes('excel');
+            if (!isValidDoc) {
+                console.log(`[⏭️ IGNORED] Unsupported document type: ${docFileName} (${docMime})`);
+                await sock.sendMessage(sender, { text: "⚠️ Ye file type support nahi hota. Kripya sirf Excel (.xlsx, .xls) ya CSV files hi bhejein." });
+                return;
+            }
+        }
+
+        // 1. AI Intent Classification (Fast)
+        console.log(`\n[🧠 AI PARSER] Sending caption/text to Gemini for INTENT parsing...`);
+        const parsedIntent = await parseIntent(textMessage);
+        
+        // If it's a document, check the file name for "with spacing" keywords
+        if (isDocument) {
+            const lowerFileName = docFileName.toLowerCase();
+            if (lowerFileName.includes('with space') || lowerFileName.includes('with spacing') || 
+                lowerFileName.includes('keep space') || lowerFileName.includes('keep spacing')) {
+                parsedIntent.keepSpacing = true;
+            }
+        }
+
+        console.log(`   ➜ Action: ${parsedIntent.action}`);
+        console.log(`   ➜ Discount: ${parsedIntent.vendorDiscount || 'None'}`);
+        console.log(`   ➜ Keep Spacing: ${parsedIntent.keepSpacing}`);
+
+        if (parsedIntent.action === 'IGNORE') {
+             console.log(`[⏭️ IGNORED] AI marked as IGNORE.`);
+             await sock.sendMessage(sender, { text: "⚠️ Mujhe samajh nahi aaya. Kripya numbers bhejein ya koi valid request likhein (jaise 'add', 'remove')." });
+             return;
+        }
+
+        if (parsedIntent.action === 'DEACTIVATE' || parsedIntent.action === 'ACTIVATE') {
+            const targetStatus = parsedIntent.action === 'DEACTIVATE' ? 'vendor deactivated' : 'available';
+            await importService.updateVendorStatus(vendorId, targetStatus);
+            const replyMsg = await generateReply(parsedIntent.action);
+            await sock.sendMessage(sender, { text: replyMsg });
+            return;
+        }
+
+        if (parsedIntent.action === 'INQUIRY') {
+            const inquiryData = await importService.getVendorInquiry(vendorId);
+            if (!inquiryData) {
+                await sock.sendMessage(sender, { text: "❌ Sorry, I could not fetch your account details right now. Please try again later." });
+                return;
+            }
+            const replyMsg = await generateReply('INQUIRY', 0, [], [], [], inquiryData);
+            await sock.sendMessage(sender, { text: replyMsg });
+            return;
+        }
+
+        // 2. Data Extraction & Splitting
+        let addText = '';
+        let removeText = '';
+        let addBuffer = null;
+
+        if (isDocument) {
+            console.log(`[📁 EXCEL] Downloading document: ${docFileName}...`);
+            addBuffer = await downloadMediaMessage(
+                msg,
+                'buffer',
+                {},
+                { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+            );
+            console.log(`[📁 EXCEL] Document downloaded.`);
+            // Documents are inherently ADD unless specifically said REMOVE, but we'll respect intent
+        } else {
+            if (parsedIntent.action === 'MIXED') {
+                const chunks = splitMixedIntentText(textMessage);
+                addText = chunks.addText;
+                removeText = chunks.removeText;
+            } else if (parsedIntent.action === 'ADD') {
+                addText = textMessage;
+            } else if (parsedIntent.action === 'REMOVE') {
+                removeText = textMessage;
+            }
+        }
+
+        let combinedReply = "";
+
+        // ---- REMOVE PROCESSING ----
+        if (removeText || (isDocument && parsedIntent.action === 'REMOVE')) {
+            console.log(`[📝 REMOVE] Processing Removal chunk...`);
+            let removeResultData = isDocument ? processExcelBuffer(addBuffer, parsedIntent.keepSpacing) : processText(removeText, parsedIntent.keepSpacing);
+            
+            if (removeResultData.validNumbers.length > 0) {
+                const itemsToRemove = removeResultData.validNumbers.map(v => ({ number: v.number }));
+                const removeResult = await importService.removeNumbers(itemsToRemove, vendorId);
+                
+                let failedIds = [];
+                let unauthorizedIds = [];
+                if (removeResult && removeResult.result) {
+                    if (removeResult.result.failedItems) failedIds = removeResult.result.failedItems.map(f => f.identifier);
+                    if (removeResult.result.unauthorizedItems) unauthorizedIds = removeResult.result.unauthorizedItems;
+                }
+                
+                combinedReply += await generateReply('REMOVE', removeResultData.validNumbers.length - failedIds.length - unauthorizedIds.length, [], failedIds, unauthorizedIds);
+            } else {
+                combinedReply += "❌ No valid 10-digit numbers found to remove.";
+            }
+        }
+
+        // ---- ADD PROCESSING ----
+        if (addText || (isDocument && parsedIntent.action !== 'REMOVE' && parsedIntent.action !== 'IGNORE')) {
+            console.log(`[📝 ADD] Processing Add chunk...`);
+            let addResultData = isDocument && addBuffer ? processExcelBuffer(addBuffer, parsedIntent.keepSpacing) : processText(addText, parsedIntent.keepSpacing);
+            
+            if (addResultData.validNumbers.length > 0) {
+                const itemsToAdd = addResultData.validNumbers.map(v => ({
+                    number: v.number,
+                    styledNumber: v.styledNumber,
+                    category: v.categoryId, 
+                    rate: v.vendorRate || parsedIntent.vendorRate || '',
+                    discount: parsedIntent.vendorDiscount || '0',
+                    port: parsedIntent.readyToPort || 'RTP'
+                }));
+
+                console.log(`\n[☁️ UPLOAD] Uploading ${addResultData.validNumbers.length} numbers to server...`);
+                // Show top 3 numbers being uploaded in the console for clarity
+                const sample = addResultData.validNumbers.slice(0, 3).map(n => n.styledNumber).join(', ');
+                console.log(`   ➜ Sample: ${sample}${addResultData.validNumbers.length > 3 ? '...' : ''}`);
+
+                await importService.processAndImport(itemsToAdd, vendorId, parsedIntent.keepSpacing);
+                
+                if (combinedReply.length > 0) combinedReply += "\n\n";
+                combinedReply += await generateReply('ADD', itemsToAdd, addResultData.invalidNumbers);
+            } else {
+                if (combinedReply.length > 0) combinedReply += "\n\n";
+                combinedReply += await generateReply('ADD', 0, addResultData.invalidNumbers);
+            }
+        }
+
+        if (combinedReply) {
+            await sock.sendMessage(sender, { text: combinedReply.trim() });
+        }
+
+    } catch (err) {
+        console.error('Message Processing error:', err.message);
+        await sock.sendMessage(sender, { text: "⚠️ System Error: Unable to process the request." }).catch(console.error);
+    }
+}
+
 async function connectToWhatsApp() {
     console.log('⌛ Generating WhatsApp session...');
-    
-    console.log('⌛ Calling useMultiFileAuthState...');
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     console.log('✅ useMultiFileAuthState done!');
 
-    console.log('⌛ Calling makeWASocket...');
     sock = makeWASocket({
         auth: state,
-        logger: pino({ level: 'debug' }), // Show all logs
+        logger: pino({ level: 'silent' }), // Switched from debug to silent to avoid JSON log spam
         browser: ["NumberwaleBot", "Chrome", "1.0.0"],
     });
-    console.log('✅ makeWASocket done!');
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        const { updateQRStatus } = require('../services/importService');
         
-        console.log(`[🔗 CONNECTION UPDATE] Status: ${connection || 'Connecting...'} | QR Present: ${!!qr}`);
-
         if (qr) {
             currentQR = qr;
             isConnected = false;
-            console.log('\nScan this QR Code to connect your WhatsApp:');
             qrcode.generate(qr, { small: true });
-            // Send QR to server for Admin panel display
-            updateQRStatus(qr, false).catch(() => {});
+            importService.updateQRStatus(qr, false).catch(() => {});
         }
 
         if (connection === 'close') {
             isConnected = false;
             currentQR = null;
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`[🔗 CONNECTION CLOSED] Reason code: ${lastDisconnect?.error?.output?.statusCode}, Should reconnect: ${shouldReconnect}`);
             if (shouldReconnect) {
                 connectToWhatsApp();
             } else {
                 console.log('❌ Logged out from WhatsApp! Deleting session folder...');
                 require('fs').rmSync('auth_info_baileys', { recursive: true, force: true });
-                updateQRStatus(null, false).catch(() => {});
-                console.log('🔄 Session deleted. Please restart the bot to scan a new QR code.');
+                importService.updateQRStatus(null, false).catch(() => {});
                 process.exit(1);
             }
         } else if (connection === 'open') {
             isConnected = true;
             currentQR = null;
             console.log('\n✅ WhatsApp Connected!');
-            // Update admin panel status to connected
-            updateQRStatus(null, true).catch(() => {});
+            importService.updateQRStatus(null, true).catch(() => {});
         }
     });
 
-    // Group update listener for auto-registration
     sock.ev.on('groups.update', async (updates) => {
         for (const update of updates) {
             if (!update.subject) continue; 
-            console.log(`\n[🔍 WHATSAPP] Group Name Update Detected: "${update.subject}" (JID: ${update.id})`);
-
             const PATTERN = /^(.+?)\(numberwale\)/i;
             const match = update.subject.trim().match(PATTERN);
 
             if (match) {
-                console.log(`[🔍 WHATSAPP] Pattern matched! Extracted Vendor Name: "${match[1].trim()}"`);
                 await autoRegisterIfValid(update.id, update.subject);
             } else {
-                console.log(`[🔍 WHATSAPP] Pattern did not match for "${update.subject}". Deactivating if exists...`);
-                await VendorGroup.findOneAndUpdate(
-                    { groupJid: update.id },
-                    { active: false }
-                );
-                console.log(`[⚠️ VENDOR] Vendor Group Deactivated: ${update.id}`);
+                await VendorGroup.findOneAndUpdate({ groupJid: update.id }, { active: false });
             }
         }
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        console.log(`\n[🔍 DEBUG] messages.upsert event triggered! Type: ${type}`);
-        const msg = messages[0];
-        if (!msg) {
-            console.log(`[🔍 DEBUG] No message object in array.`);
-            return;
-        }
-
-        if (msg.key.fromMe) {
-            console.log(`[🔍 DEBUG] Ignoring message from me.`);
-            return;
-        }
+        // Prevent duplicate processing by only reacting to 'notify' (new messages)
+        if (type !== 'notify') return;
         
-        if (!msg.message) {
-            console.log(`[🔍 DEBUG] Message has no content (stub/system message).`);
-            return;
-        }
+        const msg = messages[0];
+        if (!msg || msg.key.fromMe || !msg.message) return;
         
         const sender = msg.key.remoteJid;
-        console.log(`[🔍 DEBUG] Message from sender: ${sender}`);
+        if (!sender.endsWith('@g.us')) return;
 
-        if (!sender.endsWith('@g.us')) {
-            console.log(`[🔍 DEBUG] Ignoring message from non-group chat.`);
-            return; 
-        }
-
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || msg.message.documentMessage?.caption || '';
-        if (!text) {
-            console.log(`[🔍 DEBUG] No text/caption found in the message. Types present: ${Object.keys(msg.message).join(', ')}`);
-            return; 
-        }
-
-        console.log(`\n[📩 MESSAGE RECEIVED] From JID: ${sender}`);
-        console.log(`[📩 CONTENT]: "${text}"`);
-
-        console.log(`[🔍 VENDOR CHECK] Looking up vendor for JID: ${sender}...`);
         let vendor = await getVendorByGroup(sender);
-
         if (!vendor) {
-            console.log(`[🔍 VENDOR CHECK] Not found in DB. Fetching group metadata from WhatsApp...`);
             try {
                 const metadata = await sock.groupMetadata(sender);
-                console.log(`[🔍 VENDOR CHECK] Group name fetched: "${metadata.subject}"`);
                 vendor = await autoRegisterIfValid(sender, metadata.subject);
             } catch (err) {
                 console.error("[❌ ERROR] Failed to fetch group metadata:", err.message);
             }
-            if (!vendor) {
-                console.log(`[⏭️ IGNORED] Message ignored as group does not match vendor pattern.`);
-                return;
-            }
+            if (!vendor) return;
         }
 
-        console.log(`[✅ VENDOR MATCHED] Message from Authorized Vendor: ${vendor.vendorName} (${vendor.vendorId})`);
-        await handleMessage(sock, sender, text, vendor.vendorId);
+        await processVendorMessage(sock, msg, sender, vendor.vendorId);
     });
 
     sock.ev.on('creds.update', saveCreds);
 }
 
-module.exports = { connectToWhatsApp, getBotStatus };
+module.exports = {
+    connectToWhatsApp,
+    getBotStatus
+};

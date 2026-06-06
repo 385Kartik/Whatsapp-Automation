@@ -41,20 +41,28 @@ async function processAndImport(items, vendorId, keepSpacing = false) {
             const discount = String(item.discount || '0').replace(/\D/g, '');
             const portStatus = (item.port && item.port.toUpperCase() === 'CRTP') ? 'CRTP' : 'RTP';
             
-            const res = classifyEngine(clean);
+            let catId, styled;
             
-            let styled = "";
-            if (keepSpacing) {
-                styled = applyBothWithCustomSpaces(numStrForSpace, res.matches);
+            if (item.styledNumber && item.category) {
+                // Use pre-classified values if they exist (from new local classifier flow)
+                catId = item.category;
+                styled = item.styledNumber;
             } else {
-                styled = applyBoth(clean, res.matches);
+                // Fallback to legacy behavior
+                const res = classifyEngine(clean);
+                catId = res.catId;
+                if (keepSpacing) {
+                    styled = applyBothWithCustomSpaces(numStrForSpace, res.matches);
+                } else {
+                    styled = applyBoth(clean, res.matches);
+                }
             }
             
-            const catName = CAT[res.catId] || 'Category';
+            const catName = CAT[catId] || 'Category';
 
             tableData.push({
                 'ORIGINAL NUMBER': clean,
-                'CATEGORY ID': res.catId,
+                'CATEGORY ID': catId,
                 'CATEGORY NAME': catName,
                 'STYLED NUMBER': styled,
                 'RATE': rate,
@@ -63,7 +71,7 @@ async function processAndImport(items, vendorId, keepSpacing = false) {
                 'PORT': portStatus
             });
 
-            return [clean, styled, res.catId, portStatus, rate, discount, vendorId];
+            return [clean, styled, catId, portStatus, rate, discount, vendorId];
         });
 
         console.log(`\n[📊 CLASSIFICATION RESULTS]`);
