@@ -69,8 +69,8 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         console.log(`   ➜ Discount: ${parsedIntent.vendorDiscount || 'None'}`);
         console.log(`   ➜ Keep Spacing: ${parsedIntent.keepSpacing}`);
 
-        // If it's a document, don't let AI ignore it just because the caption was short/meaningless
-        if (isDocument && (parsedIntent.action === 'IGNORE' || parsedIntent.action === 'HELP')) {
+        // If it's a document, force it to be an ADD or REMOVE action
+        if (isDocument && !['ADD', 'REMOVE', 'MIXED'].includes(parsedIntent.action)) {
             console.log(`[🤖 AI OVERRIDE] Document detected with vague caption. Overriding ${parsedIntent.action} to ADD.`);
             parsedIntent.action = 'ADD';
         }
@@ -96,6 +96,26 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         }
 
         if (parsedIntent.action === 'INQUIRY') {
+            if (parsedIntent.inquiry_type === 'STATEMENT') {
+                await sock.sendMessage(sender, { text: "⏳ Fetching your detailed statement..." });
+                const pdfResult = await importService.downloadVendorStatementPDF(vendorId);
+                if (!pdfResult.success) {
+                    if (pdfResult.reason === 'NOT_FOUND') {
+                        await sock.sendMessage(sender, { text: "⚠️ Aapke is account me filhal koi active statement ya orders nahi hain." });
+                    } else {
+                        await sock.sendMessage(sender, { text: "❌ Sorry, I could not generate your statement PDF right now. Please try again later." });
+                    }
+                    return;
+                }
+                await sock.sendMessage(sender, { 
+                    document: pdfResult.buffer, 
+                    mimetype: 'application/pdf', 
+                    fileName: 'Numberwale_Vendor_Statement.pdf',
+                    caption: '📄 Here is your detailed vendor statement.'
+                });
+                return;
+            }
+
             const inquiryData = await importService.getVendorInquiry(vendorId);
             if (!inquiryData) {
                 await sock.sendMessage(sender, { text: "❌ Sorry, I could not fetch your account details right now. Please try again later." });
@@ -141,7 +161,7 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         // ---- REMOVE PROCESSING ----
         if (removeText || (isDocument && parsedIntent.action === 'REMOVE')) {
             console.log(`[📝 REMOVE] Processing Removal chunk...`);
-            let removeResultData = isDocument ? processExcelBuffer(addBuffer, parsedIntent.keepSpacing) : processText(removeText, parsedIntent.keepSpacing);
+            let removeResultData = isDocument && addBuffer ? processExcelBuffer(addBuffer, parsedIntent.vendorDiscount, parsedIntent.readyToPort, parsedIntent.keepSpacing) : processText(removeText, parsedIntent.vendorDiscount, parsedIntent.readyToPort, parsedIntent.keepSpacing);
             
             if (removeResultData.validNumbers.length > 0) {
                 const itemsToRemove = removeResultData.validNumbers.map(v => ({ number: v.number }));
@@ -163,7 +183,7 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
         // ---- ADD PROCESSING ----
         if (addText || (isDocument && parsedIntent.action !== 'REMOVE' && parsedIntent.action !== 'IGNORE')) {
             console.log(`[📝 ADD] Processing Add chunk...`);
-            let addResultData = isDocument && addBuffer ? processExcelBuffer(addBuffer, parsedIntent.keepSpacing) : processText(addText, parsedIntent.keepSpacing);
+            let addResultData = isDocument && addBuffer ? processExcelBuffer(addBuffer, parsedIntent.vendorDiscount, parsedIntent.readyToPort, parsedIntent.keepSpacing) : processText(addText, parsedIntent.vendorDiscount, parsedIntent.readyToPort, parsedIntent.keepSpacing);
             
             if (addResultData.validNumbers.length > 0) {
                 const itemsToAdd = [];
@@ -179,8 +199,8 @@ async function processVendorMessage(sock, msg, sender, vendorId) {
                             styledNumber: v.styledNumber,
                             category: v.categoryId, 
                             rate: rateVal,
-                            discount: parsedIntent.vendorDiscount || '0',
-                            port: parsedIntent.readyToPort || 'RTP'
+                            discount: v.discountStr || parsedIntent.vendorDiscount || '0',
+                            port: v.statusStr || parsedIntent.readyToPort || 'RTP'
                         });
                     }
                 });

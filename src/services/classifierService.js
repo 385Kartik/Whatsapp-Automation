@@ -289,7 +289,7 @@ function applyBothWithCustomSpaces(rawStr, matches) {
 }
 
 // Parses raw text messages sent by user
-function processText(text, withSpace = false) {
+function processText(text, globalVendorDiscount = null, globalVendorStatus = 'RTP', withSpace = false) {
     const lines = text.split('\n');
     let validNumbers = [];
     let invalidNumbers = [];
@@ -312,11 +312,37 @@ function processText(text, withSpace = false) {
 
         if (!normalizedLine) return;
         
-        let blockRateMatch = normalizedLine.match(/(?:rs\.?|₹|rate:?|price:?|pick any)\s*(\d+(?:[.,]\d+)?)(k)?\s*(?:\/|-|each|fixed|₹|\*|👇|👆|$)/i);
+        // Match standalone status
+        let statusMatch = normalizedLine.match(/^(rtp|crtp)$/i);
+        if (statusMatch) {
+            extractedItems.push({ type: 'status', statusStr: statusMatch[1].toUpperCase() });
+            return;
+        }
+
+        // Match standalone discount
+        let blockDiscountMatch = normalizedLine.match(/^(\d+(?:\.\d+)?)\s*(%|off|discount)$/i);
+        if (blockDiscountMatch) {
+            extractedItems.push({ type: 'discount', discountStr: blockDiscountMatch[1] + (blockDiscountMatch[2]==='%'?'%':'') });
+            return;
+        }
+
+        // Match explicit block rate like "Rs 500", or standalone abbreviation like "650L", "380k"
+        let blockRateMatch = normalizedLine.match(/^(?:rs\.?|₹|rate:?|price:?|pick any)?\s*(\d+(?:\.\d+)?)\s*(k|l|lakh)?\s*(?:\/|-|each|fixed|₹|\*|👇|👆|$)/i);
+        
         if (blockRateMatch) {
-            let baseRate = parseFloat(blockRateMatch[1].replace(',', ''));
-            if (blockRateMatch[2] && blockRateMatch[2].toLowerCase() === 'k') baseRate *= 1000;
-            extractedItems.push({ type: 'rate', rateStr: String(baseRate) });
+            let baseRate = parseFloat(blockRateMatch[1]);
+            let suffix = (blockRateMatch[2] || '').toLowerCase();
+            if (suffix === 'k') baseRate *= 1000;
+            if (suffix === 'l' || suffix === 'lakh') {
+                if (baseRate >= 100) baseRate = baseRate / 100; // Vendor slang: 230L means 2.30 Lakhs
+                baseRate *= 100000;
+            }
+            
+            // Only push if it's explicitly a rate (had a currency symbol/word or a k/l suffix)
+            // If it's just a raw number "123" without 'Rs' or 'k/L', it might be a quantity or something else, but if it's on a line alone, we treat it as rate.
+            if (blockRateMatch[0].match(/(rs\.?|₹|rate:?|price:?|pick any|k|l|lakh)/i) || /^\d+(?:\.\d+)?$/.test(normalizedLine)) {
+                extractedItems.push({ type: 'rate', rateStr: String(baseRate) });
+            }
         }
 
         let totalDigitsInLine = normalizedLine.replace(/\D/g, '').length;
@@ -325,13 +351,20 @@ function processText(text, withSpace = false) {
         let cleanLine = normalizedLine.replace(/^(add|remove|delete)\s+/i, '').trim();
         let numStr = '';
         let rateStr = '';
+        let statusStr = '';
+        let discountStr = '';
 
-        let explicitSepMatch = cleanLine.match(/^(.*?)(?:@|rs\.?|₹|rate:?|price:?)\s*(\d+(?:\.\d+)?)(k)?\s*$/i);
+        let explicitSepMatch = cleanLine.match(/^(.*?)(?:@|rs\.?|₹|rate:?|price:?)\s*(\d+(?:\.\d+)?)\s*(k|l|lakh)?\s*$/i);
         
         if (explicitSepMatch) {
             numStr = explicitSepMatch[1].trim();
             let baseRate = parseFloat(explicitSepMatch[2]);
-            if (explicitSepMatch[3] && explicitSepMatch[3].toLowerCase() === 'k') baseRate *= 1000;
+            let suffix = (explicitSepMatch[3] || '').toLowerCase();
+            if (suffix === 'k') baseRate *= 1000;
+            if (suffix === 'l' || suffix === 'lakh') {
+                if (baseRate >= 100) baseRate = baseRate / 100;
+                baseRate *= 100000;
+            }
             rateStr = String(baseRate);
         } else {
             let digitRegex = /\d+/g;
@@ -355,9 +388,23 @@ function processText(text, withSpace = false) {
             if (splitIndex !== -1) {
                 numStr = cleanLine.substring(0, splitIndex).trim();
                 let remaining = cleanLine.substring(splitIndex).trim();
-                let kMatch = remaining.match(/(\d+(?:\.\d+)?)(k)/i);
-                if (kMatch) {
-                    rateStr = String(parseFloat(kMatch[1]) * 1000);
+                
+                let rtpMatch = remaining.match(/\b(rtp|crtp)\b/i);
+                if (rtpMatch) statusStr = rtpMatch[1].toUpperCase();
+
+                let discountMatchInline = remaining.match(/(\d+(?:\.\d+)?)\s*(%|off|discount)\b/i);
+                if (discountMatchInline) discountStr = discountMatchInline[1] + (discountMatchInline[2]==='%'?'%':'');
+
+                let klMatch = remaining.match(/(\d+(?:\.\d+)?)\s*(k|l|lakh)\b/i);
+                if (klMatch) {
+                    let baseRate = parseFloat(klMatch[1]);
+                    let suffix = klMatch[2].toLowerCase();
+                    if (suffix === 'k') baseRate *= 1000;
+                    if (suffix === 'l' || suffix === 'lakh') {
+                        if (baseRate >= 100) baseRate = baseRate / 100;
+                        baseRate *= 100000;
+                    }
+                    rateStr = String(baseRate);
                 } else {
                     // Remove any discount percentage tokens (like "2%", "12 %") before extracting digits
                     let remainingNoDiscount = remaining.replace(/\b\d+(?:\.\d+)?\s*%/g, '');
@@ -391,28 +438,42 @@ function processText(text, withSpace = false) {
                 type: 'number',
                 number: cleanNum,
                 numStr: numStr,
-                rateStr: rateStr || null
+                rateStr: rateStr || null,
+                statusStr: statusStr || null,
+                discountStr: discountStr || null
             });
         }
     });
 
     let currentBottomUpRate = null;
+    let currentBottomUpStatus = null;
+    let currentBottomUpDiscount = null;
+    
     for (let i = extractedItems.length - 1; i >= 0; i--) {
         let item = extractedItems[i];
-        if (item.type === 'rate') {
-            currentBottomUpRate = item.rateStr;
-        } else if (item.type === 'number' && !item.rateStr && currentBottomUpRate) {
-            item.rateStr = currentBottomUpRate;
+        if (item.type === 'rate') currentBottomUpRate = item.rateStr;
+        else if (item.type === 'status') currentBottomUpStatus = item.statusStr;
+        else if (item.type === 'discount') currentBottomUpDiscount = item.discountStr;
+        else if (item.type === 'number') {
+            if (!item.rateStr && currentBottomUpRate) item.rateStr = currentBottomUpRate;
+            if (!item.statusStr && currentBottomUpStatus) item.statusStr = currentBottomUpStatus;
+            if (!item.discountStr && currentBottomUpDiscount) item.discountStr = currentBottomUpDiscount;
         }
     }
 
     let currentTopDownRate = null;
+    let currentTopDownStatus = null;
+    let currentTopDownDiscount = null;
+
     for (let i = 0; i < extractedItems.length; i++) {
         let item = extractedItems[i];
-        if (item.type === 'rate') {
-            currentTopDownRate = item.rateStr;
-        } else if (item.type === 'number') {
+        if (item.type === 'rate') currentTopDownRate = item.rateStr;
+        else if (item.type === 'status') currentTopDownStatus = item.statusStr;
+        else if (item.type === 'discount') currentTopDownDiscount = item.discountStr;
+        else if (item.type === 'number') {
             if (!item.rateStr && currentTopDownRate) item.rateStr = currentTopDownRate;
+            if (!item.statusStr && currentTopDownStatus) item.statusStr = currentTopDownStatus;
+            if (!item.discountStr && currentTopDownDiscount) item.discountStr = currentTopDownDiscount;
             
             const res = classifyEngine(item.number);
             let styled = '';
@@ -427,7 +488,9 @@ function processText(text, withSpace = false) {
                 number: item.number,
                 styledNumber: styled,
                 categoryId: res.catId,
-                vendorRate: item.rateStr || null
+                vendorRate: item.rateStr || null,
+                statusStr: item.statusStr || null,
+                discountStr: item.discountStr || null
             });
         } else if (item.type === 'invalid') {
             invalidNumbers.push(item.rawLine);
@@ -438,7 +501,7 @@ function processText(text, withSpace = false) {
 }
 
 // Parses downloaded excel/csv buffer
-function processExcelBuffer(buffer, withSpace = false) {
+function processExcelBuffer(buffer, globalVendorDiscount = null, globalVendorStatus = 'RTP', withSpace = false) {
     let validNumbers = [];
     let invalidNumbers = [];
     
@@ -452,7 +515,7 @@ function processExcelBuffer(buffer, withSpace = false) {
     }
     
     let headers = excelJson[0];
-    let numColIdx = -1, rateColIdx = -1;
+    let numColIdx = -1, rateColIdx = -1, discountColIdx = -1, statusColIdx = -1;
     
     for (let i = 0; i < headers.length; i++) {
         let h = String(headers[i] || '').toLowerCase().trim();
@@ -460,6 +523,8 @@ function processExcelBuffer(buffer, withSpace = false) {
         else if (numColIdx === -1 && (h.includes('number') || h.includes('mobile'))) numColIdx = i;
         
         if (h === 'vendor rate' || h === 'rate' || h === 'price') rateColIdx = i;
+        if (h === 'discount' || h === 'dis' || h === 'discounts' || h === 'vendor discount') discountColIdx = i;
+        if (h === 'status' || h === 'rtp' || h === 'crtp' || h === 'type') statusColIdx = i;
     }
     
     if (numColIdx === -1) numColIdx = 0; 
@@ -478,7 +543,17 @@ function processExcelBuffer(buffer, withSpace = false) {
         
         let rateStr = '';
         if (rateColIdx !== -1) {
-            rateStr = String(row[rateColIdx] || '');
+            rateStr = String(row[rateColIdx] || '').trim();
+        }
+
+        let discountStr = globalVendorDiscount;
+        if (discountColIdx !== -1 && String(row[discountColIdx] || '').trim()) {
+            discountStr = String(row[discountColIdx] || '').trim();
+        }
+
+        let statusStr = globalVendorStatus;
+        if (statusColIdx !== -1 && String(row[statusColIdx] || '').trim()) {
+            statusStr = String(row[statusColIdx] || '').trim();
         }
         
         if (cleanNum.length > 0 && cleanNum.length !== 10) {
@@ -501,7 +576,9 @@ function processExcelBuffer(buffer, withSpace = false) {
                 number: cleanNum,
                 styledNumber: styled,
                 categoryId: res.catId,
-                vendorRate: rateStr || null
+                vendorRate: rateStr || null,
+                discountStr: discountStr || null,
+                statusStr: statusStr || 'RTP'
             });
         }
     }

@@ -197,6 +197,21 @@ async function updateQRStatus(qr, connected) {
     }
 }
 
+async function downloadVendorStatementPDF(vendorId) {
+    try {
+        const res = await client.get(`${BASE_URL}/api/v1/oldVendorStatement/nwc/vendors/${vendorId}/statement/download-pdf`, {
+            responseType: 'arraybuffer'
+        });
+        return { success: true, buffer: Buffer.from(res.data, 'binary') };
+    } catch (err) {
+        if (err.response && err.response.status === 404) {
+            return { success: false, reason: 'NOT_FOUND' };
+        }
+        console.error('[❌ API ERROR] Failed to download vendor statement PDF:', err.message);
+        return { success: false, reason: 'ERROR' };
+    }
+}
+
 module.exports = {
     loginBot,
     processAndImport,
@@ -204,5 +219,6 @@ module.exports = {
     startAutoLogin,
     updateVendorStatus,
     getVendorInquiry,
-    updateQRStatus
+    updateQRStatus,
+    downloadVendorStatementPDF
 };

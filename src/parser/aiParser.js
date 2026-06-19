@@ -3,11 +3,21 @@ const Groq = require('groq-sdk');
 const OpenAI = require('openai');
 
 // ─── Clients Init ─────────────────────────────────────────────────────────
-const groqKey = process.env.GROQ_API_KEY;
-if (!groqKey) {
-    console.warn('[⚠️ GROQ] GROQ_API_KEY not found in .env! Skipping Groq models.');
+const groqKeys = [];
+if (process.env.GROQ_API_KEY) groqKeys.push(process.env.GROQ_API_KEY);
+if (process.env.GROQ_API_KEYS) groqKeys.push(...process.env.GROQ_API_KEYS.split(',').map(k => k.trim()));
+for (let i = 1; i <= 5; i++) {
+    if (process.env[`GROQ_API_KEY_${i}`]) groqKeys.push(process.env[`GROQ_API_KEY_${i}`]);
 }
-const groq = groqKey ? new Groq({ apiKey: groqKey }) : null;
+
+const uniqueGroqKeys = [...new Set(groqKeys)].filter(Boolean);
+const groqClients = uniqueGroqKeys.map(key => new Groq({ apiKey: key }));
+
+if (groqClients.length === 0) {
+    console.warn('[⚠️ GROQ] No GROQ API Keys found in .env! Skipping Groq models.');
+} else {
+    console.log(`[🟢 GROQ] Initialized ${groqClients.length} Groq API keys for smart load balancing.`);
+}
 
 const openaiKey = process.env.OPENAI_API_KEY;
 if (!openaiKey) {
@@ -27,7 +37,7 @@ const GROQ_MODELS = [
 
 // ─── System Prompt ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You're an intent classifier for Numberwale.com company a VIP mobile number vendor platform. Return ONLY valid JSON:
-{"action":"ADD|REMOVE|MIXED|DEACTIVATE|ACTIVATE|INQUIRY|HELP|IGNORE","inquiry_type":"OUTSTANDING|NUMBERS|ALL|null","vendorRate":"","vendorDiscount":"","readyToPort":"RTP|CRTP","keepSpacing":false,"reply_message":""}
+{"action":"ADD|REMOVE|MIXED|DEACTIVATE|ACTIVATE|INQUIRY|HELP|IGNORE","inquiry_type":"OUTSTANDING|NUMBERS|ALL|STATEMENT|null","vendorRate":"","vendorDiscount":"","readyToPort":"RTP|CRTP","keepSpacing":false,"reply_message":""}
 
 RULES:
 - ADD: vendor sent real 10-digit phone numbers.
@@ -35,12 +45,12 @@ RULES:
 - MIXED: both add & remove in same msg.
 - DEACTIVATE: vendor offline (leave/chutti).
 - ACTIVATE: vendor back (available/open).
-- INQUIRY: asking account data (balance/dues/hisaab).
+- INQUIRY: asking account data (balance/dues/hisaab) OR asking for PDF statement (mera statement / my statement / download statement -> inquiry_type: "STATEMENT").
 - HELP: asking how to use bot (NO actual numbers provided).
 - IGNORE: greetings (hi/thanks).
 
 EXTRACTION:
-- vendorRate: flat price (e.g. "5000 ka", "@ 3000").
+- vendorRate: flat price. CRITICAL: Convert abbreviations to full numeric strings without commas. 'k' = multiply by 1000 (e.g. "10k" -> "10000", "2.5k" -> "2500"). 'L' or 'lakh' = multiply by 100,000 (e.g. "2.3L" -> "230000", "5L" -> "500000").
 - vendorDiscount: ONLY if "discount/off/%".
 - readyToPort: "CRTP" if explicitly "CRTP" else "RTP".
 - keepSpacing: true if "keep spacing/with space" else false.
@@ -53,50 +63,55 @@ async function callLLMWithRetry(userMessage, maxRetries = 3) {
     let lastError = null;
     
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        // --- 1. Try All Groq Models First ---
-        if (groq) {
+        // --- 1. Try All Groq Models Across All Keys ---
+        if (groqClients.length > 0) {
             for (let i = 0; i < GROQ_MODELS.length; i++) {
                 const currentModel = GROQ_MODELS[i];
-                try {
-                    const completion = await groq.chat.completions.create({
-                    model: currentModel,
-                    messages: [
-                        { role: 'system', content: SYSTEM_PROMPT },
-                        { role: 'user', content: `Vendor message:\n${userMessage}\n\nReturn only the JSON object.` }
-                    ],
-                    temperature: 0,
-                    response_format: { type: 'json_object' },
-                    max_tokens: 300,
-                });
-                return completion.choices[0]?.message?.content?.trim();
-            } catch (err) {
-                lastError = err;
-                const status = err?.status || err?.statusCode || 0;
-
-                if (status === 429) {
-                    console.warn(`[⚠️ GROQ 429] Rate limit hit on ${currentModel}. Switching to next...`);
-                    continue; // Instantly try the next model
-                }
-                if (status === 503 || status === 500) {
-                    console.warn(`[⚠️ GROQ ${status}] Server issue on ${currentModel}. Switching to next...`);
-                    continue; // Instantly try the next model
-                }
                 
-                if (status === 401 || status === 403) {
-                    console.error(`[❌ GROQ AUTH] Invalid API key or unauthorized. Skipping Groq...`);
-                    break; // Break out of Groq loop to allow OpenAI fallback
+                for (let clientIdx = 0; clientIdx < groqClients.length; clientIdx++) {
+                    const groqClient = groqClients[clientIdx];
+                    try {
+                        const completion = await groqClient.chat.completions.create({
+                            model: currentModel,
+                            messages: [
+                                { role: 'system', content: SYSTEM_PROMPT },
+                                { role: 'user', content: `Vendor message:\n${userMessage}\n\nReturn only the JSON object.` }
+                            ],
+                            temperature: 0,
+                            response_format: { type: 'json_object' },
+                            max_tokens: 300,
+                        });
+                        return completion.choices[0]?.message?.content?.trim();
+                    } catch (err) {
+                        lastError = err;
+                        const status = err?.status || err?.statusCode || 0;
+
+                        if (status === 429) {
+                            console.warn(`[⚠️ GROQ 429] Rate limit hit on ${currentModel} (Key ${clientIdx + 1}). Trying next key...`);
+                            continue; // Try next API key for the same model
+                        }
+                        if (status === 503 || status === 500) {
+                            console.warn(`[⚠️ GROQ ${status}] Server issue on ${currentModel} (Key ${clientIdx + 1}). Switching to next model...`);
+                            break; // Stop trying this model on other keys, switch to next model
+                        }
+                        
+                        if (status === 401 || status === 403) {
+                            console.error(`[❌ GROQ AUTH] Invalid API key (Key ${clientIdx + 1}). Skipping this key...`);
+                            continue; // Try next key
+                        }
+                        
+                        // For other errors, log and switch to next model
+                        console.warn(`[⚠️ GROQ] Error on ${currentModel} (Key ${clientIdx + 1}): ${err.message}`);
+                        break;
+                    }
                 }
-                // For other errors, log and continue to next model
-                console.warn(`[⚠️ GROQ] Error on ${currentModel}: ${err.message}`);
-                continue;
             }
         }
-        }
         
-        // --- 2. Fallback to OpenAI if all Groq models fail ---
+        // --- 2. Fallback to OpenAI if all Groq models on all keys fail ---
         if (openai) {
             try {
-                if (groq) console.warn(`[⚠️ FALLBACK] All Groq models failed. Falling back to OpenAI (gpt-4o-mini)...`);
+                if (groqClients.length > 0) console.warn(`[⚠️ FALLBACK] All Groq models on all keys failed. Falling back to OpenAI (gpt-4o-mini)...`);
                 const completion = await openai.chat.completions.create({
                     model: 'gpt-4o-mini',
                     messages: [
@@ -134,17 +149,30 @@ function safeOfflineFallback(text) {
     }
     const lower = text.toLowerCase().trim();
 
-    // 100% safe: Pure 10-digit numbers only → ADD
+    // 100% safe: Pure 10-digit numbers only → ADD (With custom fallback message)
     const stripped = text.replace(/[\d\s,\-\*\(\)\.]/g, '');
     if (stripped === '' && /\d{10}/.test(text)) {
-        return { action: 'ADD', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
+        return { 
+            action: 'ADD', 
+            inquiry_type: null, 
+            vendorRate: '', 
+            vendorDiscount: '', 
+            readyToPort: 'RTP', 
+            keepSpacing: false, 
+            reply_message: '⚠️ AI system is currently offline. We are parsing your numbers using basic offline mode, so please recheck the uploaded numbers. If there is an error, please reshare the numbers according to the guide. Till that time, we are trying to make our AI server alive again.' 
+        };
     }
 
     // 100% safe: Exact single-word deactivate/activate commands
     if (lower === 'deactivate') return { action: 'DEACTIVATE', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
     if (lower === 'activate') return { action: 'ACTIVATE', inquiry_type: null, vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
 
-    // Everything else that's ambiguous → tell vendor AI is temporarily down
+    // 100% safe: Statement requests
+    if (lower.includes('my statement') || lower.includes('mera statement')) {
+        return { action: 'INQUIRY', inquiry_type: 'STATEMENT', vendorRate: '', vendorDiscount: '', readyToPort: 'RTP', keepSpacing: false, reply_message: '' };
+    }
+
+    // Everything else that's ambiguous → tell vendor AI is temporarily down with custom message
     return {
         action: 'IGNORE',
         inquiry_type: null,
@@ -152,7 +180,7 @@ function safeOfflineFallback(text) {
         vendorDiscount: '',
         readyToPort: 'RTP',
         keepSpacing: false,
-        reply_message: '⚠️ Our AI system is temporarily unavailable. Please try again in a moment.'
+        reply_message: '⚠️ AI system is currently offline. We are parsing your numbers using basic offline mode, so please recheck the uploaded numbers. If there is an error, please reshare the numbers according to the guide. Till that time, we are trying to make our AI server alive again.'
     };
 }
 
